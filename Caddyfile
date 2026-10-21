@@ -1,0 +1,8 @@
+{$BULLE_HOST} {
+	reverse_proxy bulle:8080 {
+		# Long polls wait up to 25 s.
+		transport http {
+			read_timeout 60s
+		}
+	}
+}
