@@ -57,7 +57,10 @@ if command -v ufw >/dev/null 2>&1 && $SUDO ufw status | grep -q "Status: active"
 fi
 
 say "Démarrage du serveur Bulle…"
-$SUDO docker compose up -d --build --remove-orphans
+$SUDO docker compose build
+# A data volume created by an earlier version belongs to root: given to the server's user.
+$SUDO docker compose run --rm --no-deps --user root --entrypoint chown bulle -R node:node /data
+$SUDO docker compose up -d --remove-orphans
 
 for _ in $(seq 1 60); do
   if curl -fsS --max-time 5 "https://$BULLE_HOST/health" >/dev/null 2>&1; then
