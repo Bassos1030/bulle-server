@@ -29263,8 +29263,8 @@ var Gate = class {
     next.go();
   }
 };
-var READER_CONCURRENCY = 24;
-var AHEAD_CONCURRENCY = 8;
+var READER_CONCURRENCY = 48;
+var AHEAD_CONCURRENCY = 24;
 var IDLE_MS = 30 * 6e4;
 function runId(url, s, french = false) {
   return (0, import_node_crypto.createHash)("sha256").update(`${url}|${s.model}|${s.keepSfx}|${s.hideCredits}|${french}`).digest("hex").slice(0, 24);
@@ -29466,7 +29466,7 @@ var VERSION2 = "1.0.0";
 var PORT = Number(process.env.PORT || 8080);
 var TOKEN = process.env.BULLE_TOKEN || "";
 var DATA = process.env.DATA_DIR || "/data";
-var MAX_CALLS = Number(process.env.MAX_CLAUDE_CALLS || 32);
+var MAX_CALLS = Number(process.env.MAX_CLAUDE_CALLS || 72);
 if (TOKEN.length < 16) {
   console.error("BULLE_TOKEN manquant ou trop court (16 caract\xE8res au moins).");
   process.exit(1);
