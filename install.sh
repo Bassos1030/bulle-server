@@ -11,7 +11,12 @@ say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
 if ! command -v docker >/dev/null 2>&1; then
   say "Installation de Docker…"
-  curl -fsSL https://get.docker.com | $SUDO sh
+  # Docker's own packages; a release too new for them: Ubuntu's.
+  curl -fsSL https://get.docker.com | $SUDO sh || {
+    $SUDO apt-get update
+    $SUDO apt-get install -y docker.io docker-compose-v2 || $SUDO apt-get install -y docker.io docker-compose-plugin
+  }
+  $SUDO systemctl enable --now docker >/dev/null 2>&1 || true
 fi
 $SUDO docker compose version >/dev/null 2>&1 || { echo "Docker Compose est introuvable."; exit 1; }
 
@@ -20,20 +25,30 @@ if [ ! -f .env ]; then
   HOST="${BULLE_HOST:-${IP//./-}.sslip.io}"
   TOKEN="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32)"
   umask 077
-  printf 'BULLE_HOST=%s\nBULLE_TOKEN=%s\n' "$HOST" "$TOKEN" > .env
+  printf 'BULLE_HOST=%s\nBULLE_TOKEN=%s\nPUBLIC_IP=%s\n' "$HOST" "$TOKEN" "$IP" > .env
 fi
 . ./.env
 
-# Ports 80 and 443 (HTTPS certificate): free, or already ours.
+# Ports 80 and 443 (HTTPS certificate) on the public address: free, or already ours. Something
+# listening on another address only (a VPN such as Tailscale): Bulle listens on the public one.
 running="$($SUDO docker compose ps --services --status running 2>/dev/null || true)"
 if ! grep -qx caddy <<<"$running"; then
+  other=0
   for p in 80 443; do
-    if $SUDO ss -ltnH "( sport = :$p )" | grep -q .; then
-      echo "Le port $p est déjà utilisé sur cette machine :"
-      $SUDO ss -ltnpH "( sport = :$p )" || true
-      exit 1
-    fi
+    for a in $($SUDO ss -ltnH "( sport = :$p )" | awk '{print $4}'); do
+      case "$a" in
+        "0.0.0.0:$p" | "*:$p" | "[::]:$p" | "${PUBLIC_IP:-none}:$p")
+          echo "Le port $p est déjà utilisé sur l’adresse publique :"
+          $SUDO ss -ltnpH "( sport = :$p )" || true
+          exit 1
+          ;;
+        *) other=1 ;;
+      esac
+    done
   done
+  if [ "$other" = 1 ] && [ -n "${PUBLIC_IP:-}" ] && ! grep -q '^BIND_IP=' .env; then
+    echo "BIND_IP=$PUBLIC_IP" >> .env
+  fi
 fi
 
 if command -v ufw >/dev/null 2>&1 && $SUDO ufw status | grep -q "Status: active"; then
