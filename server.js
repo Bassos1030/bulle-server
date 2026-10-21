@@ -21036,6 +21036,73 @@ function costUsd(model, usage, fast = false, refusalCategory, batch = false) {
   return total;
 }
 
+// src/refinePool.ts
+var import_node_os = require("node:os");
+var import_node_path = require("node:path");
+var import_node_worker_threads = require("node:worker_threads");
+var RefinePool = class {
+  idle = [];
+  queue = [];
+  pending = /* @__PURE__ */ new Map();
+  /** The task each busy worker holds. */
+  busy = /* @__PURE__ */ new Map();
+  seq = 0;
+  constructor(size = Math.max(1, (0, import_node_os.availableParallelism)() - 1)) {
+    for (let i = 0; i < size; i++) this.spawn();
+  }
+  spawn() {
+    const w = new import_node_worker_threads.Worker((0, import_node_path.join)(__dirname, "refine-worker.js"));
+    w.on("message", ({ id, answer }) => {
+      this.pending.get(id)?.(answer);
+      this.pending.delete(id);
+      this.busy.delete(w);
+      this.give(w);
+    });
+    w.on("error", (e) => console.error("refine worker", e));
+    w.on("exit", () => {
+      this.idle = this.idle.filter((x) => x !== w);
+      const id = this.busy.get(w);
+      if (id !== void 0) {
+        this.pending.get(id)?.({ error: "worker exited" });
+        this.pending.delete(id);
+        this.busy.delete(w);
+      }
+      this.spawn();
+    });
+    this.give(w);
+  }
+  give(w) {
+    if (!this.queue.length) {
+      this.idle.push(w);
+      return;
+    }
+    let best = 0;
+    for (let i = 1; i < this.queue.length; i++) if (this.queue[i].prio < this.queue[best].prio) best = i;
+    const [q] = this.queue.splice(best, 1);
+    this.pending.set(q.task.id, q.done);
+    this.busy.set(w, q.task.id);
+    w.postMessage(q.task);
+  }
+  /** Every text of a tile, `prio()` read as each starts (0: the reader's chapter). */
+  refine(raster, asks, prio) {
+    let data = raster.data;
+    if (!(data.buffer instanceof SharedArrayBuffer)) {
+      data = new Uint8Array(new SharedArrayBuffer(raster.data.length));
+      data.set(raster.data);
+    }
+    const tile = { width: raster.width, height: raster.height, data };
+    return Promise.all(
+      asks.map(
+        (ask) => new Promise((done) => {
+          this.queue.push({ prio: prio(), task: { id: ++this.seq, raster: tile, ask }, done });
+          const w = this.idle.pop();
+          if (w) this.give(w);
+        })
+      )
+    );
+  }
+};
+
 // src/runner.ts
 var import_node_crypto = require("node:crypto");
 
@@ -21629,7 +21696,7 @@ function decodeTrieDict(input, resultLength, atomCount, dict1AtomCount, ngramCou
   }
   readNgramReferences(ngramCount - dictSize + dict1AtomCount, dictSize + dict2AtomCount);
   readNgramReferences(dictSize - dict1AtomCount, dict1AtomCount);
-  const pool = new Uint16Array(poolSize);
+  const pool2 = new Uint16Array(poolSize);
   let write = 0;
   for (let index = 0; index < ngramIndex; index++) {
     for (let half = 0; half < 2; half++) {
@@ -21639,9 +21706,9 @@ function decodeTrieDict(input, resultLength, atomCount, dict1AtomCount, ngramCou
         let read = start[source];
         const readEnd = read + length[source];
         while (read < readEnd)
-          pool[write++] = pool[read++];
+          pool2[write++] = pool2[read++];
       } else {
-        pool[write++] = value;
+        pool2[write++] = value;
       }
     }
   }
@@ -21657,7 +21724,7 @@ function decodeTrieDict(input, resultLength, atomCount, dict1AtomCount, ngramCou
       let read = start[slot];
       const readEnd = read + length[slot];
       while (read < readEnd)
-        out[outIndex++] = pool[read++];
+        out[outIndex++] = pool2[read++];
     } else {
       out[outIndex++] = value;
     }
@@ -25143,6 +25210,12 @@ function colorDistance(a, b) {
   const db = a[2] - b[2];
   return Math.sqrt(0.3 * dr * dr + 0.59 * dg * dg + 0.11 * db * db);
 }
+function pixelDistance(data, i, b) {
+  const dr = data[i] - b[0];
+  const dg = data[i + 1] - b[1];
+  const db = data[i + 2] - b[2];
+  return Math.sqrt(0.3 * dr * dr + 0.59 * dg * dg + 0.11 * db * db);
+}
 function toHex([r, g, b]) {
   const h = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
   return `#${h(r)}${h(g)}${h(b)}`;
@@ -26073,7 +26146,7 @@ function labelBackground(img, win, bg) {
   for (let y = 0; y < wh; y++) {
     for (let x = 0; x < ww; x++) {
       const i = ((y + win.y) * width + (x + win.x)) * 4;
-      if (colorDistance([data[i], data[i + 1], data[i + 2]], bg) < 40) isBg[y * ww + x] = 1;
+      if (pixelDistance(data, i, bg) < 40) isBg[y * ww + x] = 1;
     }
   }
   const labels = new Int32Array(ww * wh);
@@ -26086,8 +26159,8 @@ function labelBackground(img, win, bg) {
     while (stack.length) {
       const p = stack.pop();
       const x = p % ww;
-      const nbs = [x > 0 ? p - 1 : -1, x < ww - 1 ? p + 1 : -1, p - ww, p + ww];
-      for (const q of nbs) {
+      for (let k = 0; k < 4; k++) {
+        const q = k === 0 ? x > 0 ? p - 1 : -1 : k === 1 ? x < ww - 1 ? p + 1 : -1 : k === 2 ? p - ww : p + ww;
         if (q < 0 || q >= ww * wh || !isBg[q] || labels[q]) continue;
         labels[q] = next;
         stack.push(q);
@@ -26130,8 +26203,7 @@ function findGlyphs(img, win, proposed, debug) {
     for (let y = 0; y < around.h; y++) {
       for (let x = 0; x < around.w; x++) {
         const i = ((y + around.y) * width + (x + around.x)) * 4;
-        const c = [data[i], data[i + 1], data[i + 2]];
-        if (colorDistance(c, bg) <= 70 && Math.abs(luma(c[0], c[1], c[2]) - bgLuma) <= 60) skip[y * around.w + x] = 1;
+        if (pixelDistance(data, i, bg) <= 70 && Math.abs(luma(data[i], data[i + 1], data[i + 2]) - bgLuma) <= 60) skip[y * around.w + x] = 1;
         else other++;
       }
     }
@@ -26151,10 +26223,7 @@ function glyphsOn(img, win, proposed, bg, debug) {
   for (let y = 0; y < wh; y++) {
     for (let x = 0; x < ww; x++) {
       const i = ((y + win.y) * width + (x + win.x)) * 4;
-      const c = [data[i], data[i + 1], data[i + 2]];
-      const d = colorDistance(c, bg);
-      const contrast = Math.abs(luma(c[0], c[1], c[2]) - bgLuma);
-      if (d > 70 || contrast > 60) mask[y * ww + x] = 1;
+      if (pixelDistance(data, i, bg) > 70 || Math.abs(luma(data[i], data[i + 1], data[i + 2]) - bgLuma) > 60) mask[y * ww + x] = 1;
     }
   }
   const comps = components(mask, ww, wh);
@@ -26277,14 +26346,14 @@ function glyphsOn(img, win, proposed, bg, debug) {
     if (ch / cw > 5) return false;
     return ch >= typical * 0.6 && ch <= typical * 1.35 && c.x0 >= limit2.x0 && c.y0 >= limit2.y0 && c.x1 <= limit2.x1 && c.y1 <= limit2.y1 && (!textRegion || region.get(c) === textRegion);
   };
-  const pool = letterLike.filter((c) => !inSet.has(c) && letterSized(c));
+  const pool2 = letterLike.filter((c) => !inSet.has(c) && letterSized(c));
   const gapX = typical * 0.9;
   const gapY = typical * 0.6;
   const growSideways = () => {
     let changed = true;
     while (changed) {
       changed = false;
-      for (const c of pool) {
+      for (const c of pool2) {
         if (inSet.has(c)) continue;
         const cy = (c.y0 + c.y1) / 2;
         if (!isolatedOnBackground(mask, ww, wh, c)) continue;
@@ -26307,7 +26376,7 @@ function glyphsOn(img, win, proposed, bg, debug) {
     }
   };
   const addLine = () => {
-    const near = pool.filter((c) => {
+    const near = pool2.filter((c) => {
       if (inSet.has(c)) return false;
       const dy = Math.max(0, box.y0 - c.y1, c.y0 - box.y1);
       return dy > 0 && dy <= gapY;
@@ -26491,7 +26560,7 @@ function backgroundFlatness(img, ring, text, bg) {
       if (x >= text.x && x < text.x + text.w && y >= text.y && y < text.y + text.h) continue;
       const i = (y * width + x) * 4;
       total++;
-      if (colorDistance([data[i], data[i + 1], data[i + 2]], bg) < 28) near++;
+      if (pixelDistance(data, i, bg) < 28) near++;
     }
   }
   return total ? near / total : 0;
@@ -26538,16 +26607,19 @@ function floodInterior(img, text, bg, opts = {}) {
   const { data, width } = img;
   const tol = 24;
   const near = new Uint8Array(lw * lh);
-  for (let y = 0; y < lh; y++) {
-    for (let x = 0; x < lw; x++) {
-      const i = ((y + lim.y) * width + (x + lim.x)) * 4;
-      near[y * lw + x] = colorDistance([data[i], data[i + 1], data[i + 2]], bg) < tol ? 1 : 0;
+  const isNear = (p) => {
+    let v = near[p];
+    if (!v) {
+      const x = p % lw;
+      const i = (((p - x) / lw + lim.y) * width + (x + lim.x)) * 4;
+      v = near[p] = pixelDistance(data, i, bg) < tol ? 1 : 2;
     }
-  }
+    return v === 1;
+  };
   const glyph = (x, y) => opts.glyphAt ? opts.glyphAt(x + lim.x, y + lim.y) : false;
   const passable = (x, y) => {
     const p = y * lw + x;
-    if (near[p] && (x === 0 || near[p - 1]) && (x === lw - 1 || near[p + 1]) && (y === 0 || near[p - lw]) && (y === lh - 1 || near[p + lw])) {
+    if (isNear(p) && (x === 0 || isNear(p - 1)) && (x === lw - 1 || isNear(p + 1)) && (y === 0 || isNear(p - lw)) && (y === lh - 1 || isNear(p + lw))) {
       return true;
     }
     return glyph(x, y);
@@ -26565,6 +26637,10 @@ function floodInterior(img, text, bg, opts = {}) {
   if (!stack.length) return reject("no seed");
   let leaked = false;
   let filled = 0;
+  let fx0 = lw;
+  let fx1 = -1;
+  let fy0 = lh;
+  let fy1 = -1;
   while (stack.length) {
     const p = stack.pop();
     if (visited[p]) continue;
@@ -26573,6 +26649,10 @@ function floodInterior(img, text, bg, opts = {}) {
     if (!passable(x, y)) continue;
     visited[p] = 1;
     filled++;
+    if (x < fx0) fx0 = x;
+    if (x > fx1) fx1 = x;
+    if (y < fy0) fy0 = y;
+    if (y > fy1) fy1 = y;
     if (opts.onVisit) opts.onVisit(x + lim.x, y + lim.y);
     const atLimit = x === 0 || y === 0 || x === lw - 1 || y === lh - 1;
     const atImageEdge = x + lim.x === 0 || y + lim.y === 0 || x + lim.x === img.width - 1 || y + lim.y === img.height - 1;
@@ -26588,20 +26668,7 @@ function floodInterior(img, text, bg, opts = {}) {
   if (leaked) return reject("leak");
   if (filled < text.w * text.h * 0.25) return reject("small fill");
   const inText = (x, y) => x + lim.x >= text.x && x + lim.x < text.x + text.w && y + lim.y >= text.y && y + lim.y < text.y + text.h;
-  const outside = new Uint8Array(lw * lh);
-  const out = [];
-  for (let x = 0; x < lw; x++) out.push(x, (lh - 1) * lw + x);
-  for (let y = 0; y < lh; y++) out.push(y * lw, y * lw + lw - 1);
-  while (out.length) {
-    const p = out.pop();
-    if (outside[p] || visited[p]) continue;
-    outside[p] = 1;
-    const x = p % lw;
-    if (x > 0) out.push(p - 1);
-    if (x < lw - 1) out.push(p + 1);
-    if (p >= lw) out.push(p - lw);
-    if (p < lw * lh - lw) out.push(p + lw);
-  }
+  const outside = outsideOf(visited, lw, lh, fx0, fy0, fx1, fy1);
   const interior = (x, y) => visited[y * lw + x] === 1 || outside[y * lw + x] === 0 || inText(x, y);
   const ccx = Math.round(text.x + text.w / 2 - lim.x);
   const ccy = Math.round(text.y + text.h / 2 - lim.y);
@@ -26784,6 +26851,30 @@ function outsideUniformity(img, runs2, y0, y1, lim) {
   if (!total) return 0;
   return Math.max(...bins.values()) / total;
 }
+function outsideOf(filled, w, h, x0, y0, x1, y1) {
+  const outside = new Uint8Array(w * h).fill(1);
+  if (x1 < x0 || y1 < y0) return outside;
+  const bx0 = Math.max(0, x0 - 1);
+  const by0 = Math.max(0, y0 - 1);
+  const bx1 = Math.min(w - 1, x1 + 1);
+  const by1 = Math.min(h - 1, y1 + 1);
+  for (let y = by0; y <= by1; y++) outside.fill(0, y * w + bx0, y * w + bx1 + 1);
+  const stack = [];
+  for (let x = bx0; x <= bx1; x++) stack.push(by0 * w + x, by1 * w + x);
+  for (let y = by0; y <= by1; y++) stack.push(y * w + bx0, y * w + bx1);
+  while (stack.length) {
+    const p = stack.pop();
+    if (outside[p] || filled[p]) continue;
+    outside[p] = 1;
+    const x = p % w;
+    const y = (p - x) / w;
+    if (x > bx0) stack.push(p - 1);
+    if (x < bx1) stack.push(p + 1);
+    if (y > by0) stack.push(p - w);
+    if (y < by1) stack.push(p + w);
+  }
+  return outside;
+}
 function dilate(mask, w, h, r) {
   const tmp = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
@@ -26841,16 +26932,19 @@ function clusterBalloon(img, text, bg, opts, scale) {
   const n = lw * lh;
   const { data, width } = img;
   const near = new Uint8Array(n);
-  for (let y = 0; y < lh; y++) {
-    for (let x = 0; x < lw; x++) {
-      const i = ((y + lim.y) * width + (x + lim.x)) * 4;
-      near[y * lw + x] = colorDistance([data[i], data[i + 1], data[i + 2]], bg) < 24 ? 1 : 0;
+  const isNear = (p) => {
+    let v = near[p];
+    if (!v) {
+      const x = p % lw;
+      const i = (((p - x) / lw + lim.y) * width + (x + lim.x)) * 4;
+      v = near[p] = pixelDistance(data, i, bg) < 24 ? 1 : 2;
     }
-  }
+    return v === 1;
+  };
   const glyph = (x, y) => opts.glyphAt ? opts.glyphAt(x + lim.x, y + lim.y) : false;
   const passable = (x, y) => {
     const p = y * lw + x;
-    if (near[p] && (x === 0 || near[p - 1]) && (x === lw - 1 || near[p + 1]) && (y === 0 || near[p - lw]) && (y === lh - 1 || near[p + lw])) return true;
+    if (isNear(p) && (x === 0 || isNear(p - 1)) && (x === lw - 1 || isNear(p + 1)) && (y === 0 || isNear(p - lw)) && (y === lh - 1 || isNear(p + lw))) return true;
     return glyph(x, y);
   };
   const visited = new Uint8Array(n);
@@ -26866,6 +26960,10 @@ function clusterBalloon(img, text, bg, opts, scale) {
   }
   if (!stack.length) return reject("no seed");
   let filled = 0;
+  let fx0 = lw;
+  let fx1 = -1;
+  let fy0 = lh;
+  let fy1 = -1;
   while (stack.length) {
     const p = stack.pop();
     if (visited[p]) continue;
@@ -26874,6 +26972,10 @@ function clusterBalloon(img, text, bg, opts, scale) {
     if (!passable(x, y)) continue;
     visited[p] = 1;
     filled++;
+    if (x < fx0) fx0 = x;
+    if (x > fx1) fx1 = x;
+    if (y < fy0) fy0 = y;
+    if (y > fy1) fy1 = y;
     const atLimit = x === 0 || y === 0 || x === lw - 1 || y === lh - 1;
     const atImageEdge = x + lim.x === 0 || y + lim.y === 0 || x + lim.x === img.width - 1 || y + lim.y === img.height - 1;
     if (atLimit && !atImageEdge) return "leak";
@@ -26883,23 +26985,7 @@ function clusterBalloon(img, text, bg, opts, scale) {
     if (y < lh - 1) stack.push(p + lw);
   }
   if (filled < text.w * text.h * 0.25) return reject("small fill");
-  const outside = new Uint8Array(n);
-  for (let x = 0; x < lw; x++) {
-    stack.push(x, (lh - 1) * lw + x);
-  }
-  for (let y = 0; y < lh; y++) {
-    stack.push(y * lw, y * lw + lw - 1);
-  }
-  while (stack.length) {
-    const p = stack.pop();
-    if (outside[p] || visited[p]) continue;
-    outside[p] = 1;
-    const x = p % lw;
-    if (x > 0) stack.push(p - 1);
-    if (x < lw - 1) stack.push(p + 1);
-    if (p >= lw) stack.push(p - lw);
-    if (p < n - lw) stack.push(p + lw);
-  }
+  const outside = outsideOf(visited, lw, lh, fx0, fy0, fx1, fy1);
   const inR = (x, y) => {
     const lx = x - lim.x;
     const ly = y - lim.y;
@@ -26921,7 +27007,7 @@ function clusterBalloon(img, text, bg, opts, scale) {
   for (let y = 0; y < lh; y++) {
     let l = -1;
     let r = -1;
-    for (let x = 0; x < lw; x++) {
+    for (let x = y < fy0 || y > fy1 ? lw : fx0; x <= fx1 && x < lw; x++) {
       const p = y * lw + x;
       if ((visited[p] || !outside[p]) && own(x + lim.x, y + lim.y)) {
         cellCount++;
@@ -27186,7 +27272,7 @@ function growOverBackground(img, text, bg, flat) {
       for (let x = x02; x <= x12; x++) {
         const i = (y * width + x) * 4;
         n++;
-        if (colorDistance([data[i], data[i + 1], data[i + 2]], bg) >= 30) bad++;
+        if (pixelDistance(data, i, bg) >= 30) bad++;
       }
     }
     return n > 0 && bad / n < 0.01;
@@ -28890,12 +28976,33 @@ var ChapterJob = class {
    */
   async applyResultPaced(tile, result, raster, idPrefix = "") {
     const ctx = this.applyStart(tile, result, raster, idPrefix, false);
+    ctx.found = await this.refineAll(result.analysis.texts, raster);
     for (const [i, t] of result.analysis.texts.entries()) {
       await this.quiet();
       if (this.cancelled) break;
       this.applyText(ctx, i, t);
     }
     return this.applyEnd(ctx);
+  }
+  /** Where each text of a tile sits, found at once by `deps.refine` (when given): by index. */
+  async refineAll(texts, raster) {
+    if (!this.deps.refine) return void 0;
+    const asks = [];
+    const at = [];
+    texts.forEach((t, i) => {
+      if (sameLettering(t.en, t.fr)) return;
+      at.push(i);
+      asks.push({ box: t.box, overArt: t.container === "none", others: texts.filter((_, j) => j !== i).map((o) => o.box) });
+    });
+    if (!asks.length) return void 0;
+    try {
+      const answers = await this.deps.refine(raster, asks);
+      const found = [];
+      at.forEach((i, k) => found[i] = answers[k]);
+      return found;
+    } catch {
+      return void 0;
+    }
   }
   applyStart(tile, result, raster, idPrefix, manual) {
     const { analysis } = result;
@@ -28915,7 +29022,7 @@ var ChapterJob = class {
       }
     }
     const minFontPx = this.deps.settings.minFontPt * strip2.width / this.deps.settings.screenWidthPt;
-    return { tile, analysis, raster, idPrefix, manual, accounted, minFontPx };
+    return { tile, analysis, raster, idPrefix, manual, accounted, minFontPx, found: void 0 };
   }
   applyText(ctx, i, t) {
     const { tile, analysis, raster, idPrefix, manual, accounted, minFontPx } = ctx;
@@ -28933,7 +29040,7 @@ var ChapterJob = class {
       return;
     }
     const others = analysis.texts.filter((_, j) => j !== i).map((o) => o.box);
-    const region = this.buildRegion(tile, `${idPrefix}${tile.y0}-${i}`, t, raster, minFontPx, others, manual);
+    const region = this.buildRegion(tile, `${idPrefix}${tile.y0}-${i}`, t, raster, minFontPx, others, manual, ctx.found?.[i]);
     if (!region) {
       this.note(tile.index, `\xAB${t.en.slice(0, 18)}\xBB \xE9cart\xE9e: ${this.dropReason}`);
       if (!this.dropReason.startsWith("exception")) accounted.push(t.box);
@@ -28985,14 +29092,15 @@ var ChapterJob = class {
       this.glossary = mergeGlossary(merged, this.glossary);
     }).catch(() => void 0);
   }
-  buildRegion(tile, id, t, raster, minFontPx, others, manual = false) {
+  buildRegion(tile, id, t, raster, minFontPx, others, manual = false, pre) {
     this.dropReason = "";
     if (sameLettering(t.en, t.fr)) {
       this.dropReason = "identique";
       return null;
     }
     try {
-      let refined = refineRegion(raster, t.box, { overArt: t.container === "none", others });
+      if (pre && "error" in pre) throw new Error(pre.error);
+      let refined = pre ?? refineRegion(raster, t.box, { overArt: t.container === "none", others });
       const decorativeKind = (t.kind === "sfx" || t.kind === "sign") && t.container === "none";
       const found = refined.textBox.w * refined.textBox.h;
       if (!decorativeKind && !refined.enclosed && refined.confident && found < t.box.w * t.box.h * 0.25 && t.box.w >= t.box.h * 2.5) {
@@ -29214,7 +29322,7 @@ var SharpImageOps = class {
     return { mean, std };
   }
   async composeTile(parts, width, height) {
-    const canvas = Buffer.alloc(width * height * 4, 255);
+    const canvas = Buffer.from(new SharedArrayBuffer(width * height * 4)).fill(255);
     for (const p of parts) {
       const f = this.file(p.image);
       const top = Math.max(0, Math.min(f.height - 1, Math.round(p.srcY)));
@@ -29364,6 +29472,7 @@ var Runner = class {
         screenWidthPt: 390,
         downloads: 12
       },
+      refine: this.deps.pool ? (raster, asks) => this.deps.pool.refine(raster, asks, () => run.priority) : void 0,
       onUpdate: (s) => {
         run.state = s;
         this.bump(run);
@@ -29416,7 +29525,7 @@ function samePages(a, b) {
 var import_node_crypto2 = require("node:crypto");
 var import_node_fs = require("node:fs");
 var import_promises = require("node:fs/promises");
-var import_node_path = require("node:path");
+var import_node_path2 = require("node:path");
 var name = (key) => `${(0, import_node_crypto2.createHash)("sha256").update(key).digest("hex").slice(0, 40)}.json`;
 var DiskCache = class {
   constructor(dir, maxBytes = 2e9) {
@@ -29426,27 +29535,27 @@ var DiskCache = class {
   }
   async get(key) {
     try {
-      return JSON.parse(await (0, import_promises.readFile)((0, import_node_path.join)(this.dir, name(key)), "utf8"));
+      return JSON.parse(await (0, import_promises.readFile)((0, import_node_path2.join)(this.dir, name(key)), "utf8"));
     } catch {
       return null;
     }
   }
   async set(key, value) {
-    const file = (0, import_node_path.join)(this.dir, name(key));
+    const file = (0, import_node_path2.join)(this.dir, name(key));
     await (0, import_promises.writeFile)(`${file}.tmp`, JSON.stringify(value));
     await (0, import_promises.rename)(`${file}.tmp`, file);
   }
   /** Oldest files out until the folder is under its limit. */
   trim() {
     const files = (0, import_node_fs.readdirSync)(this.dir).filter((f) => f.endsWith(".json")).map((f) => {
-      const s = (0, import_node_fs.statSync)((0, import_node_path.join)(this.dir, f));
+      const s = (0, import_node_fs.statSync)((0, import_node_path2.join)(this.dir, f));
       return { f, size: s.size, at: s.mtimeMs };
     }).sort((a, b) => a.at - b.at);
     let total = files.reduce((n, x) => n + x.size, 0);
     for (const x of files) {
       if (total <= this.maxBytes) break;
       try {
-        (0, import_node_fs.unlinkSync)((0, import_node_path.join)(this.dir, x.f));
+        (0, import_node_fs.unlinkSync)((0, import_node_path2.join)(this.dir, x.f));
         total -= x.size;
       } catch {
       }
@@ -29495,7 +29604,9 @@ async function fetchImage(url, headers) {
   throw last;
 }
 var cache = new DiskCache(`${DATA}/cache`, Number(process.env.CACHE_BYTES || 4e9));
-var runner = new Runner({ http, fetchImage, cache, glossary: new DiskGlossary(cache), maxCalls: MAX_CALLS, apiBaseUrl: process.env.ANTHROPIC_BASE_URL || void 0 });
+var workers = process.env.REFINE_WORKERS === void 0 ? void 0 : Number(process.env.REFINE_WORKERS);
+var pool = workers === 0 ? void 0 : new RefinePool(workers);
+var runner = new Runner({ http, fetchImage, cache, glossary: new DiskGlossary(cache), maxCalls: MAX_CALLS, apiBaseUrl: process.env.ANTHROPIC_BASE_URL || void 0, pool });
 var CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-headers": "authorization, content-type, x-claude-key",

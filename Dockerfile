@@ -3,7 +3,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
-COPY server.js ./
+COPY server.js refine-worker.js ./
 # The data volume takes this owner when it is created empty.
 RUN mkdir -p /data && chown node:node /data
 USER node
