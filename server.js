@@ -24762,6 +24762,7 @@ function normalizeInputUrl(input) {
   while (s.endsWith(")") && (s.match(/\(/g)?.length ?? 0) < (s.match(/\)/g)?.length ?? 0)) s = s.slice(0, -1).replace(/[.,;:!?]+$/, "");
   if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
   const u = new URL(s);
+  if (u.hash && !/^#[!/]/.test(u.hash)) u.hash = "";
   if (/^(?:www\.)?asuracomic\.net$/i.test(u.hostname)) {
     u.hostname = "asurascans.com";
     u.pathname = u.pathname.replace(/^\/series\//, "/comics/");
@@ -28111,8 +28112,14 @@ var ChapterJob = class {
     if (!view.state || view.error || view.pipeline !== void 0 && view.pipeline !== PIPELINE_VERSION) return false;
     this.remoteId = view.id;
     void this.fetchPagesToShow();
+    const already = view.state.done && !view.state.error;
     let spent = 0;
     const apply = (s2) => {
+      if (already) {
+        this.applyRemote({ ...s2, costUsd: 0 });
+        this.state.fromCache = true;
+        return;
+      }
       if (s2.costUsd > spent) remote.spent?.(s2.costUsd - spent);
       spent = Math.max(spent, s2.costUsd);
       this.applyRemote(s2);
@@ -28139,6 +28146,11 @@ var ChapterJob = class {
     this.remoteId = null;
     if (this.cancelled) return true;
     const s = view.state;
+    const unreached = s.pages.length > 0 && s.pages.every((p) => p.status === "failed" || p.hidden);
+    if (s.error?.code === "pages" || unreached && !s.regions.length) {
+      this.resetForLocal();
+      return false;
+    }
     this.state.done = true;
     if (!s.error) {
       const failed = s.refusedTiles > 0 || s.unresolved > 0 || s.tiles.some((t) => t.status === "error") || s.pages.some((p) => p.status === "failed");
@@ -29103,11 +29115,11 @@ var ChapterJob = class {
       let refined = pre ?? refineRegion(raster, t.box, { overArt: t.container === "none", others });
       const decorativeKind = (t.kind === "sfx" || t.kind === "sign") && t.container === "none";
       const found = refined.textBox.w * refined.textBox.h;
-      if (!decorativeKind && !refined.enclosed && refined.confident && found < t.box.w * t.box.h * 0.25 && t.box.w >= t.box.h * 2.5) {
+      const byModelBox = (r, lineInk) => {
         const box = clampRect(t.box, raster.width, raster.height);
-        const lines = Math.max(1, Math.round(box.h / Math.max(1, refined.lineInkHeight * 1.35)));
-        refined = {
-          ...refined,
+        const lines = Math.max(1, Math.round(box.h / Math.max(1, lineInk * 1.35)));
+        return {
+          ...r,
           textBox: box,
           lineCount: lines,
           linePitch: lines > 1 ? box.h / lines : 0,
@@ -29119,7 +29131,8 @@ var ChapterJob = class {
           spans: void 0,
           step: 1
         };
-      }
+      };
+      if (!decorativeKind && !refined.enclosed && refined.confident && found < t.box.w * t.box.h * 0.25 && t.box.w >= t.box.h * 2.5) refined = byModelBox(refined, refined.lineInkHeight);
       const overArt = !refined.flatBackground || refined.clearBehind < 0.9 || !!refined.artBeside;
       const decorative = (t.kind === "sfx" || t.kind === "sign") && t.container === "none";
       if (decorative && overArt && !manual) {
@@ -29135,18 +29148,30 @@ var ChapterJob = class {
         this.dropReason = "onomatop\xE9e coup\xE9e";
         return null;
       }
-      const region = planRegion({
+      const plan = (r) => planRegion({
         id,
         kind: t.kind,
         original: t.en,
         translation: t.fr,
         style: { uppercase: t.uppercase, bold: t.bold, italic: t.italic, color: t.color, strokeColor: t.strokeColor },
-        refined,
+        refined: r,
         overArt: t.container === "none",
         minFontPx,
         offset: { x: 0, y: tile.y0 }
       });
-      if (!refined.enclosed && !region.erase?.path && region.erase?.rect && region.bounds.h > region.erase.rect.h * 6 && region.lines.length >= 6) {
+      const outOfZone = (r, g) => !r.enclosed && !g.erase?.path && !!g.erase?.rect && g.bounds.h > g.erase.rect.h * 6 && g.lines.length >= 6;
+      let region = plan(refined);
+      if (outOfZone(refined, region) && !decorativeKind && t.box.w * t.box.h > found * 4) {
+        const ink = /^#[0-9a-f]{6}$/i.test(t.color ?? "") ? t.color : refined.textColor;
+        const paper = colorDistance(fromHex(ink), fromHex(refined.bgColor)) < 120 ? refined.textColor : refined.bgColor;
+        const byBox = { ...byModelBox(refined, Math.max(refined.lineInkHeight, minFontPx * 1.1)), textColor: ink, bgColor: paper };
+        const again = plan(byBox);
+        if (!outOfZone(byBox, again)) {
+          refined = byBox;
+          region = again;
+        }
+      }
+      if (outOfZone(refined, region)) {
         this.dropReason = "texte hors zone";
         return null;
       }
