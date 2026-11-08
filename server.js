@@ -28147,7 +28147,10 @@ var ChapterJob = class {
     if (this.cancelled) return true;
     const s = view.state;
     const unreached = s.pages.length > 0 && s.pages.every((p) => p.status === "failed" || p.hidden);
-    if (s.error?.code === "pages" || unreached && !s.regions.length) {
+    const englishOnly = (view.prompt ?? 0) < 4;
+    const dialogue = s.regions.some((r) => r.kind !== "watermark" && r.translation.trim() !== "");
+    const nothing = s.tiles.length > 0 && !s.error && (englishOnly ? !dialogue : !s.regions.length);
+    if (s.error?.code === "pages" || unreached && !s.regions.length || nothing) {
       this.resetForLocal();
       return false;
     }
@@ -29442,7 +29445,7 @@ var Runner = class {
     else if (page !== void 0) run.job?.focusOnPage(page);
   }
   view(run) {
-    return { id: run.id, rev: run.rev, error: run.error ?? null, state: run.state ?? null, pipeline: PIPELINE_VERSION };
+    return { id: run.id, rev: run.rev, error: run.error ?? null, state: run.state ?? null, pipeline: PIPELINE_VERSION, prompt: PROMPT_VERSION };
   }
   open(url, req, priority, source) {
     const id = runId(url, req.settings, !!source?.french);
